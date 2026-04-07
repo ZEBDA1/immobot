@@ -19,6 +19,7 @@ class ScrapedListing:
     description: Optional[str] = None
     images: Optional[list[str]] = None
     published_at: Optional[datetime] = None
+    db_id: Optional[int] = None
 
 
 class BaseScraper:

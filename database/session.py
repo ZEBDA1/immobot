@@ -21,7 +21,13 @@ def _make_engine(url: str):
 
 
 engine = _make_engine(settings.database_url)
-SessionLocal = sessionmaker(bind=engine, autocommit=False, autoflush=False, future=True)
+SessionLocal = sessionmaker(
+    bind=engine,
+    autocommit=False,
+    autoflush=False,
+    future=True,
+    expire_on_commit=False,
+)
 
 
 def init_db():

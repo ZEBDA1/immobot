@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable, Optional
 
-from sqlalchemy import select, and_, func, delete, update
+from sqlalchemy import select, and_, func, delete, update, desc
 
 from .session import SessionLocal
 from . import models as m
@@ -40,7 +40,9 @@ def get_or_create_user(telegram_id: int, username: Optional[str] = None) -> m.Us
 
 def set_user_premium(telegram_id: int, is_premium: bool) -> None:
     with session_scope() as s:
-        user = s.execute(select(m.User).where(m.User.telegram_id == telegram_id)).scalar_one()
+        user = s.execute(select(m.User).where(m.User.telegram_id == telegram_id)).scalar_one_or_none()
+        if not user:
+            user = m.User(telegram_id=telegram_id)
         user.is_premium = is_premium
         s.add(user)
 
@@ -48,6 +50,11 @@ def set_user_premium(telegram_id: int, is_premium: bool) -> None:
 def get_user_by_id(user_id: int) -> m.User | None:
     with session_scope() as s:
         return s.execute(select(m.User).where(m.User.id == user_id)).scalar_one_or_none()
+
+
+def get_user_by_telegram_id(telegram_id: int) -> m.User | None:
+    with session_scope() as s:
+        return s.execute(select(m.User).where(m.User.telegram_id == telegram_id)).scalar_one_or_none()
 
 
 def get_user_filters(user_id: int) -> list[m.Filter]:
@@ -109,7 +116,8 @@ def get_or_create_listing(
             select(m.Listing).where(m.Listing.source == source, m.Listing.external_id == external_id)
         ).scalar_one_or_none()
         if existing:
-            return existing
+            # Only brand-new listings should be processed by the scheduler.
+            return None
         listing = m.Listing(
             source=source,
             external_id=external_id,
@@ -147,6 +155,15 @@ def mark_alert_sent(user_id: int, listing_id: int) -> None:
 
 def add_pending_alert(user_id: int, listing_id: int, not_before: datetime) -> None:
     with session_scope() as s:
+        existing = s.execute(
+            select(m.PendingAlert).where(
+                m.PendingAlert.user_id == user_id,
+                m.PendingAlert.listing_id == listing_id,
+                m.PendingAlert.status == "pending",
+            )
+        ).scalar_one_or_none()
+        if existing:
+            return
         pa = m.PendingAlert(user_id=user_id, listing_id=listing_id, not_before=not_before)
         s.add(pa)
 
@@ -177,3 +194,60 @@ def get_all_active_filters() -> list[m.Filter]:
 def get_listing_by_id(listing_id: int) -> m.Listing | None:
     with session_scope() as s:
         return s.execute(select(m.Listing).where(m.Listing.id == listing_id)).scalar_one_or_none()
+
+
+def get_recent_listings(*, hours: int = 48, limit: int = 300) -> list[m.Listing]:
+    since = datetime.utcnow() - timedelta(hours=hours)
+    with session_scope() as s:
+        rows = s.execute(
+            select(m.Listing)
+            .where(m.Listing.first_seen_at >= since)
+            .order_by(m.Listing.first_seen_at.desc())
+            .limit(limit)
+        ).scalars()
+        return list(rows)
+
+
+# Favorites
+def add_favorite(user_id: int, listing_id: int) -> bool:
+    with session_scope() as s:
+        existing = s.execute(
+            select(m.Favorite).where(m.Favorite.user_id == user_id, m.Favorite.listing_id == listing_id)
+        ).scalar_one_or_none()
+        if existing:
+            return False
+        s.add(m.Favorite(user_id=user_id, listing_id=listing_id))
+        return True
+
+
+def remove_favorite(user_id: int, listing_id: int) -> bool:
+    with session_scope() as s:
+        fav = s.execute(
+            select(m.Favorite).where(m.Favorite.user_id == user_id, m.Favorite.listing_id == listing_id)
+        ).scalar_one_or_none()
+        if not fav:
+            return False
+        s.delete(fav)
+        return True
+
+
+def is_favorite(user_id: int, listing_id: int) -> bool:
+    with session_scope() as s:
+        cnt = s.execute(
+            select(func.count()).select_from(m.Favorite).where(
+                m.Favorite.user_id == user_id, m.Favorite.listing_id == listing_id
+            )
+        ).scalar_one()
+        return cnt > 0
+
+
+def get_user_favorite_listings(user_id: int, *, limit: int = 50) -> list[m.Listing]:
+    with session_scope() as s:
+        rows = s.execute(
+            select(m.Listing)
+            .join(m.Favorite, m.Favorite.listing_id == m.Listing.id)
+            .where(m.Favorite.user_id == user_id)
+            .order_by(desc(m.Favorite.created_at))
+            .limit(limit)
+        ).scalars()
+        return list(rows)

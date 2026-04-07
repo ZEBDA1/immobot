@@ -98,3 +98,15 @@ class PendingAlert(Base):
     __table_args__ = (
         UniqueConstraint("user_id", "listing_id", name="uq_user_listing_pending"),
     )
+
+
+class Favorite(Base):
+    __tablename__ = "favorites"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    user_id: Mapped[int] = mapped_column(Integer, ForeignKey("users.id", ondelete="CASCADE"), index=True)
+    listing_id: Mapped[int] = mapped_column(Integer, ForeignKey("listings.id", ondelete="CASCADE"), index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, index=True)
+
+    __table_args__ = (
+        UniqueConstraint("user_id", "listing_id", name="uq_user_listing_favorite"),
+    )

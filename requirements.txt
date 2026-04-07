@@ -13,3 +13,5 @@ ujson==5.9.0
 orjson==3.10.6
 cachetools==5.3.3
 geopy==2.4.1
+selenium==4.25.0
+webdriver-manager==4.0.2
