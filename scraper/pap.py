@@ -7,7 +7,7 @@ from typing import Iterable, Optional
 
 from .base import BaseScraper, ScrapedListing
 from utils.hash import hash_str
-from utils.http import http_client
+from utils.http import http_client, fetch_html
 from utils.text import parse_float, parse_int
 
 
@@ -20,30 +20,50 @@ class PAPScraper(BaseScraper):
             f"https://www.pap.fr/annonce/locations?{urlencode({'q': term})}",
             f"https://www.pap.fr/annonce/vente-immobiliere?{urlencode({'q': term})}",
             f"https://www.pap.fr/?{urlencode({'q': term})}",
+            "https://www.pap.fr/annonce/locations",
+            "https://www.pap.fr/annonce/vente-immobiliere",
         ]
 
     def fetch_city(self, city: Optional[str], postal_code: Optional[str]) -> Iterable[ScrapedListing]:
-        cards = []
         cookie = os.getenv("PAP_COOKIE", "").strip()
         extra_headers = {"Cookie": cookie} if cookie else None
-        for url in self._candidate_urls(city, postal_code):
-            resp = http_client.get(
-                url,
-                referer="https://www.pap.fr/",
-                headers=extra_headers,
-                retries=2,
-                allow_statuses={403, 404, 429},
-            )
-            if resp.status_code != 200:
-                continue
-            soup = BeautifulSoup(resp.text, "html.parser")
-            cards = soup.select("a.annonce") or soup.select("a.item-annonce") or soup.select("a[href*='/annonces/']")
-            if cards:
+        all_cards = []
+        for base_url in self._candidate_urls(city, postal_code):
+            for page in range(1, 6):  # Fetch up to 5 pages to maximize listings
+                url = f"{base_url}&page={page}" if "?" in base_url else f"{base_url}?page={page}"
+                html = None
+                try:
+                    resp = http_client.get(
+                        url,
+                        referer="https://www.pap.fr/",
+                        headers=extra_headers,
+                        retries=2,
+                        allow_statuses={403, 404, 429},
+                    )
+                    if resp.status_code == 200:
+                        html = resp.text
+                except Exception:
+                    html = None
+
+                if not html:
+                    html = fetch_html(url, referer="https://www.pap.fr/")
+
+                if not html:
+                    break
+
+                soup = BeautifulSoup(html, "html.parser")
+                cards = soup.select("a.annonce") or soup.select("a.item-annonce") or soup.select("a[href*='/annonces/']")
+                if not cards:
+                    break  # No more listings
+                all_cards.extend(cards)
+                if len(all_cards) >= 100:  # Limit to 100 per source to avoid overload
+                    break
+            if all_cards:
                 break
-        if not cards:
+        if not all_cards:
             return
 
-        for a in cards:
+        for a in all_cards:
             href = a.get("href") or ""
             if href.startswith("/"):
                 href = "https://www.pap.fr" + href

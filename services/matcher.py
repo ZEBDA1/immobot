@@ -16,11 +16,14 @@ class MatchResult:
 
 
 def _within_radius(listing_loc: Optional[str], city: Optional[str], radius_km: Optional[float]) -> bool:
-    if not city or not radius_km:
+    if not city:
         return True
     if not listing_loc:
         return False
-    # Fast coarse match first to avoid unnecessary geocoding calls.
+    # If no radius provided, require at least a textual city match.
+    if not radius_km:
+        return city.lower() in listing_loc.lower()
+    # With a radius, use fast coarse check first, then geocode fallback.
     if city.lower() in listing_loc.lower():
         return True
     a = geocode(city)

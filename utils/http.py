@@ -14,6 +14,7 @@ from config import settings
 from .uagents import random_user_agent
 
 BLOCKED_STATUSES = {403, 429, 503}
+_CHROMEDRIVER_PATH: str | None = None
 
 
 class HttpClient:
@@ -49,30 +50,48 @@ class HttpClient:
         allow_statuses: Optional[set[int]] = None,
         use_proxy: bool = True,
     ) -> Response:
-        proxies = {"http": self.proxy_url, "https": self.proxy_url} if (self.proxy_url and use_proxy) else None
+        proxy_dict = {"http": self.proxy_url, "https": self.proxy_url} if (self.proxy_url and use_proxy) else None
+        transport_candidates = [proxy_dict]
+        # If proxy is flaky/blocked for a source, fallback to direct requests.
+        if proxy_dict and settings.proxy_fallback_direct:
+            transport_candidates.append(None)
         last_exc: Exception | None = None
 
-        for attempt in range(1, retries + 1):
-            time.sleep(random.uniform(0.5, 1.6))
-            h = self._build_headers(headers=headers, referer=referer)
-            try:
-                resp = self.session.get(url, headers=h, params=params, proxies=proxies, timeout=timeout)
-            except requests.RequestException as exc:
-                last_exc = exc
-                if attempt == retries:
-                    raise
-                time.sleep(min(6.0, (2 ** attempt) + random.random()))
-                continue
+        for transport_idx, proxies in enumerate(transport_candidates):
+            for attempt in range(1, retries + 1):
+                time.sleep(random.uniform(0.5, 1.6))
+                h = self._build_headers(headers=headers, referer=referer)
+                try:
+                    resp = self.session.get(url, headers=h, params=params, proxies=proxies, timeout=timeout)
+                except requests.RequestException as exc:
+                    last_exc = exc
+                    if attempt == retries and transport_idx == len(transport_candidates) - 1:
+                        raise
+                    time.sleep(min(6.0, (2 ** attempt) + random.random()))
+                    continue
 
-            if resp.status_code == 200:
-                return resp
-            if allow_statuses and resp.status_code in allow_statuses:
-                return resp
-            if resp.status_code in BLOCKED_STATUSES and attempt < retries:
-                time.sleep(min(8.0, (2 ** attempt) + random.random()))
+                if resp.status_code == 200:
+                    try:
+                        # Improve text decoding for sites with incorrect/no charset (e.g., ParuVendu accents)
+                        enc = (resp.encoding or "").lower()
+                        if not enc or enc in ("iso-8859-1", "latin-1"):
+                            ae = getattr(resp, "apparent_encoding", None)
+                            if ae:
+                                resp.encoding = ae
+                    except Exception:
+                        pass
+                    return resp
+                if allow_statuses and resp.status_code in allow_statuses:
+                    return resp
+                if resp.status_code in BLOCKED_STATUSES and attempt < retries:
+                    time.sleep(min(8.0, (2 ** attempt) + random.random()))
+                    continue
+                if resp.status_code in BLOCKED_STATUSES and transport_idx < len(transport_candidates) - 1:
+                    # Retry same request without proxy before failing.
+                    break
+                if transport_idx == len(transport_candidates) - 1:
+                    resp.raise_for_status()
                 continue
-
-            resp.raise_for_status()
 
         if last_exc:
             raise last_exc
@@ -108,19 +127,27 @@ def fetch_html(url: str, *, referer: Optional[str] = None, timeout: int = 18) ->
     if resp.status_code == 404:
         return None
     if resp.status_code in BLOCKED_STATUSES:
-        html = get_with_selenium(url, timeout_sec=max(12, timeout))
+        # Playwright is usually faster to start than Selenium+webdriver-manager.
+        html = get_with_playwright(url, timeout_ms=timeout * 1000)
         if html and not is_probably_blocked(html):
             return html
+        if os.getenv("USE_SELENIUM_FALLBACK", "true").lower() in ("1", "true", "yes"):
+            html = get_with_selenium(url, timeout_sec=max(10, timeout - 2))
+            if html and not is_probably_blocked(html):
+                return html
         return None
     if resp.status_code == 200 and resp.text and not is_probably_blocked(resp.text):
         return resp.text
 
-    # Selenium fallback first when explicitly enabled, then Playwright fallback.
+    # Playwright fallback first, then Selenium optional fallback.
+    html = get_with_playwright(url, timeout_ms=timeout * 1000)
+    if html and not is_probably_blocked(html):
+        return html
     if os.getenv("USE_SELENIUM_FALLBACK", "true").lower() in ("1", "true", "yes"):
-        html = get_with_selenium(url, timeout_sec=max(12, timeout))
+        html = get_with_selenium(url, timeout_sec=max(10, timeout - 2))
         if html and not is_probably_blocked(html):
             return html
-    return get_with_playwright(url, timeout_ms=timeout * 1000)
+    return None
 
 
 def _selenium_sync_fetch(url: str, *, timeout_sec: int = 20) -> Optional[str]:
@@ -143,8 +170,11 @@ def _selenium_sync_fetch(url: str, *, timeout_sec: int = 20) -> Optional[str]:
     options.add_experimental_option("useAutomationExtension", False)
 
     driver = None
+    global _CHROMEDRIVER_PATH
     try:
-        service = Service(ChromeDriverManager().install())
+        if not _CHROMEDRIVER_PATH:
+            _CHROMEDRIVER_PATH = ChromeDriverManager().install()
+        service = Service(_CHROMEDRIVER_PATH)
         driver = webdriver.Chrome(service=service, options=options)
         driver.set_page_load_timeout(timeout_sec)
         driver.get(url)

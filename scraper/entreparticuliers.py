@@ -66,7 +66,7 @@ class EntreParticuliersScraper(BaseScraper):
             if links:
                 break
 
-        for href, txt in list(links.items())[:80]:
+        for href, txt in list(links.items())[:100]:
             title = " ".join(txt.split()) if txt else None
             price = None
             surface = None

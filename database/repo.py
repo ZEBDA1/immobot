@@ -90,9 +90,21 @@ def create_or_update_filter(
         f.city = city
         f.postal_code = postal_code
         f.radius_km = radius_km
+        # Always reactivate the filter on create/update
+        f.active = True
         s.add(f)
         s.flush()
         return f
+
+
+def delete_filter(user_id: int, name: str) -> bool:
+    with session_scope() as s:
+        f = s.execute(select(m.Filter).where(m.Filter.user_id == user_id, m.Filter.name == name)).scalar_one_or_none()
+        if not f:
+            return False
+        f.active = False
+        s.add(f)
+        return True
 
 
 # Listings

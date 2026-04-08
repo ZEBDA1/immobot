@@ -22,6 +22,8 @@ class SeLogerScraper(BaseScraper):
             f"https://www.seloger.com/list.htm?{urlencode({'q': term})}",
             f"https://www.seloger.com/recherche.htm?{urlencode({'q': term})}",
             f"https://www.seloger.com/?{urlencode({'q': term})}",
+            "https://www.seloger.com/list.htm",
+            "https://www.seloger.com/classified-search",
         ]
 
     def _extract_first_place_id(self, data: Any) -> Optional[str]:
@@ -62,12 +64,12 @@ class SeLogerScraper(BaseScraper):
 
         search_payload = {
             "criteria": {
-                "distributionTypes": ["Rent", "Buy"],
+                "distributionTypes": ["Rent"],
                 "estateTypes": ["Apartment", "House"],
                 "projectTypes": ["Resale", "New_Build", "Projected", "Life_Annuity"],
                 "location": {"placeIds": [place_id]},
             },
-            "paging": {"page": 1, "size": 50, "order": "Default"},
+            "paging": {"page": 1, "size": 100, "order": "Default"},
         }
         search_data = fetch_json_with_playwright(
             "https://www.seloger.com/serp-bff/search",

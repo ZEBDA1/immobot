@@ -174,7 +174,7 @@ class ParuVenduScraper(BaseScraper):
 
     def fetch_city(self, city: Optional[str], postal_code: Optional[str]) -> Iterable[ScrapedListing]:
         search_url = self._search_url(city, postal_code)
-        for url in self._listing_urls(search_url)[:25]:
+        for url in self._listing_urls(search_url)[:50]:
             listing = self._parse_detail(url)
             if listing:
                 yield listing
