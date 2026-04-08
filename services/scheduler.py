@@ -16,6 +16,9 @@ from scraper.seloger import SeLogerScraper
 from scraper.pap import PAPScraper
 from scraper.paruvendu import ParuVenduScraper
 from scraper.entreparticuliers import EntreParticuliersScraper
+from scraper.logicimmo import LogicImmoScraper
+from scraper.rentola import RentolaScraper
+from scraper.ouestfranceimmo import OuestFranceImmoScraper
 from services.matcher import match_and_score
 from services.scam import detect_scam
 from services.notification import send_alert
@@ -26,7 +29,16 @@ from utils.hash import hash_str
 log = logging.getLogger(__name__)
 
 
-SCRAPERS = [ParuVenduScraper(), EntreParticuliersScraper(), LeboncoinScraper(), SeLogerScraper(), PAPScraper()]
+SCRAPERS = [
+    ParuVenduScraper(),
+    EntreParticuliersScraper(),
+    LeboncoinScraper(),
+    SeLogerScraper(),
+    PAPScraper(),
+    LogicImmoScraper(),
+    RentolaScraper(),
+    OuestFranceImmoScraper(),
+]
 _cross_source_dedupe = TTLCache(ttl_seconds=24 * 3600)
 _source_health: dict[str, dict] = {}
 
@@ -58,6 +70,13 @@ def get_sources_health() -> dict[str, dict]:
     for source, raw in _source_health.items():
         out[source] = dict(raw)
     return out
+
+
+def get_scraper(source: str):
+    for s in SCRAPERS:
+        if s.source == source:
+            return s
+    return None
 
 
 def _source_enabled(source: str) -> bool:
@@ -122,11 +141,61 @@ def _listing_signature(listing: ScrapedListing) -> str:
 
 def _unique_locations(filters: list[m.Filter]) -> list[tuple[str | None, str | None]]:
     seen: set[tuple[str | None, str | None]] = set()
+    out: list[tuple[str | None, str | None]] = []
+
+    def _norm(value: str | None) -> str | None:
+        if value is None:
+            return None
+        v = value.strip()
+        return v or None
+
     for f in filters:
-        key = (f.city, f.postal_code)
+        key = (_norm(f.city), _norm(f.postal_code))
         if key not in seen:
             seen.add(key)
-    return list(seen)
+            out.append(key)
+    return out
+
+
+def _build_scheduler_locations(filters: list[m.Filter]) -> list[tuple[str | None, str | None]]:
+    """
+    Build scheduler search locations with optional variant expansion:
+    - exact (city, postal)
+    - city-only
+    - postal-only
+    - generic (None, None), if enabled
+    """
+    base = _unique_locations(filters)
+    if not settings.expand_location_variants:
+        out = list(base)
+        if settings.include_generic_location_pass and (None, None) not in out:
+            out.append((None, None))
+        return out
+
+    seen: set[tuple[str | None, str | None]] = set()
+    out: list[tuple[str | None, str | None]] = []
+
+    def _add(city: str | None, postal: str | None) -> None:
+        key = (city, postal)
+        if key in seen:
+            return
+        seen.add(key)
+        out.append(key)
+
+    for city, postal in base:
+        _add(city, postal)
+        if city and postal:
+            _add(city, None)
+            _add(None, postal)
+        elif city:
+            _add(city, None)
+        elif postal:
+            _add(None, postal)
+
+    if settings.include_generic_location_pass:
+        _add(None, None)
+
+    return out
 
 
 async def _process_new_listing(bot: Bot, listing: ScrapedListing):
@@ -232,46 +301,98 @@ async def _fetch_listings_non_blocking(scraper, city: str | None, postal: str | 
     """
     return await asyncio.wait_for(
         asyncio.to_thread(lambda: list(scraper.fetch_city(city, postal))),
-        timeout=35,
+        timeout=max(8, settings.scraper_task_timeout_seconds),
     )
 
 
 async def _collect_source_listings(scraper, locs: list[tuple[str | None, str | None]]) -> tuple[str, list[ScrapedListing], bool, int]:
     """
-    Collect listings for one source across all locations.
+    Collect listings for one source across locations in parallel (bounded).
     Returns: (source, listings, had_hard_error, total_listings_count)
     """
     source_had_hard_error = False
-    source_total_listings = 0
     all_listings: list[ScrapedListing] = []
 
-    for city, postal in locs:
+    sem = asyncio.Semaphore(max(1, settings.per_source_concurrency))
+
+    async def _one_loc(city: str | None, postal: str | None) -> list[ScrapedListing]:
+        nonlocal source_had_hard_error
+        async with sem:
+            try:
+                return await _fetch_listings_non_blocking(scraper, city, postal)
+            except asyncio.TimeoutError:
+                source_had_hard_error = True
+                msg = f"timeout for {city}/{postal}"
+                _mark_source_failure(scraper.source, msg)
+                log.warning("Scraper %s timed out for %s/%s", scraper.source, city, postal)
+            except Exception as e:
+                source_had_hard_error = True
+                err = str(e)
+                _mark_source_failure(scraper.source, err)
+                if "404 Client Error" in err or "Playwright Sync API" in err:
+                    log.info("Scraper %s unavailable for %s/%s: %s", scraper.source, city, postal, e)
+                else:
+                    log.warning("Scraper %s failed for %s/%s: %s", scraper.source, city, postal, e)
+            return []
+
+    tasks = [asyncio.create_task(_one_loc(city, postal)) for city, postal in locs]
+    results = await asyncio.gather(*tasks, return_exceptions=False) if tasks else []
+    for lst in results:
+        all_listings.extend(lst)
+
+    return scraper.source, all_listings, source_had_hard_error, len(all_listings)
+
+
+def _sample_locs_for_source(source: str, locs: list[tuple[str | None, str | None]]) -> list[tuple[str | None, str | None]]:
+    if not locs:
+        return []
+    if settings.full_scan_mode:
+        # In scheduler mode, keep only user locations to avoid heavy duplicate scans.
+        return list(locs)
+    quota = settings.source_quota_per_cycle.get(source, settings.default_source_quota)
+    if quota <= 0:
+        return []
+    if len(locs) <= quota:
+        return list(locs)
+    try:
+        return random.sample(locs, k=quota)
+    except Exception:
+        return list(locs)[:quota]
+
+
+async def sample_source_listings(
+    source: str,
+    locs: list[tuple[str | None, str | None]],
+    *,
+    limit_locations: int = 1,
+) -> tuple[list[ScrapedListing], str | None]:
+    """
+    Collect a small sample of listings for one source without impacting health stats.
+    Returns: (listings, last_error)
+    """
+    scraper = get_scraper(source)
+    if not scraper:
+        return ([], f"Unknown source: {source}")
+    results: list[ScrapedListing] = []
+    last_error: str | None = None
+    to_visit = list(locs)[: max(0, limit_locations)] if limit_locations > 0 else []
+    if not to_visit:
+        to_visit = [(None, None)]
+    for city, postal in to_visit:
         try:
             listings = await _fetch_listings_non_blocking(scraper, city, postal)
-            source_total_listings += len(listings)
-            all_listings.extend(listings)
-        except asyncio.TimeoutError:
-            source_had_hard_error = True
-            msg = f"timeout for {city}/{postal}"
-            _mark_source_failure(scraper.source, msg)
-            log.warning("Scraper %s timed out for %s/%s", scraper.source, city, postal)
+            results.extend(listings)
         except Exception as e:
-            source_had_hard_error = True
-            err = str(e)
-            _mark_source_failure(scraper.source, err)
-            if "404 Client Error" in err or "Playwright Sync API" in err:
-                log.info("Scraper %s unavailable for %s/%s: %s", scraper.source, city, postal, e)
-            else:
-                log.warning("Scraper %s failed for %s/%s: %s", scraper.source, city, postal, e)
-
-    return scraper.source, all_listings, source_had_hard_error, source_total_listings
+            last_error = str(e)
+            continue
+    return (results, last_error)
 
 
 async def run_scheduler(bot: Bot, *, interval_min: int = 30, interval_max: int = 60):
     while True:
         try:
             filters = repo.get_all_active_filters()
-            locs = _unique_locations(filters)
+            locs = _build_scheduler_locations(filters)
             enabled_scrapers = []
             for scraper in SCRAPERS:
                 if not _source_enabled(scraper.source):
@@ -280,7 +401,12 @@ async def run_scheduler(bot: Bot, *, interval_min: int = 30, interval_max: int =
                     continue
                 enabled_scrapers.append(scraper)
 
-            tasks = [asyncio.create_task(_collect_source_listings(scraper, locs)) for scraper in enabled_scrapers]
+            tasks = []
+            for scraper in enabled_scrapers:
+                sample_locs = _sample_locs_for_source(scraper.source, locs)
+                if not sample_locs:
+                    continue
+                tasks.append(asyncio.create_task(_collect_source_listings(scraper, sample_locs)))
             if tasks:
                 results = await asyncio.gather(*tasks)
             else:
@@ -297,3 +423,35 @@ async def run_scheduler(bot: Bot, *, interval_min: int = 30, interval_max: int =
         except Exception as e:
             log.exception("Scheduler iteration failed: %s", e)
         await asyncio.sleep(random.randint(interval_min, interval_max))
+
+
+async def run_full_scan_once(bot: Bot) -> dict[str, int]:
+    """Run one full-scan pass across all enabled sources and all locations regardless of quotas.
+    Returns a dict of source->listings_count processed in this pass.
+    """
+    filters = repo.get_all_active_filters()
+    locs = _build_scheduler_locations(filters)
+    enabled_scrapers = []
+    for scraper in SCRAPERS:
+        if not _source_enabled(scraper.source):
+            continue
+        enabled_scrapers.append(scraper)
+
+    # Full scan keeps all expanded locations.
+    scan_locs = list(locs) or [(None, None)]
+
+    tasks = []
+    for scraper in enabled_scrapers:
+        tasks.append(asyncio.create_task(_collect_source_listings(scraper, scan_locs)))
+    results = await asyncio.gather(*tasks) if tasks else []
+
+    per_source_counts: dict[str, int] = {}
+    for source, listings, source_had_hard_error, source_total_listings in results:
+        for listing in listings:
+            await _process_new_listing(bot, listing)
+        if not source_had_hard_error:
+            _mark_source_success(source, source_total_listings)
+        per_source_counts[source] = source_total_listings
+
+    await _dispatch_pending(bot)
+    return per_source_counts

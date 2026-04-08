@@ -1,0 +1,12 @@
+services:
+  tgbbot:
+    build: .
+    container_name: tgbbot
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: sqlite:////app/storage/data.db
+    volumes:
+      - ./storage:/app/storage
+    command: ["python", "main.py"]
